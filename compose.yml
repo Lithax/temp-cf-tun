@@ -1,0 +1,22 @@
+services:
+  cloudflared:
+    image: cfquicktunnel:latest
+    container_name: cftunnel
+    restart: unless-stopped
+    environment:
+      SERVICE_URL: ${SERVICE_URL}
+      ACCOUNT_ID: ${ACCOUNT_ID}
+      NAMESPACE_ID: ${NAMESPACE_ID}
+      API_TOKEN: ${API_TOKEN}
+      SERVER_CERT: ${SERVER_CERT}
+      HTTP_HOST_HEADER: ${HTTP_HOST_HEADER}
+    volumes:
+      - "/etc/ssl/certs/reverse-proxy.pem:/etc/ssl/certs/server.crt:ro"
+    networks:
+      - cftunnel
+    build:
+      context: .
+
+networks:
+  cftunnel:
+    external: true
