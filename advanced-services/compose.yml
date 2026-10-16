@@ -32,6 +32,7 @@ services:
     environment:
       NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
       PROXY_TUNNEL_SECRET: ${PROXY_TUNNEL_SECRET}
+      URL_SECRET: ${URL_SECRET}
       # what cloudflared rewrites the Host header to; must match server_name
       # in nginx.conf.template (defaults to HTTP_HOST_HEADER in the .env)
       HTTP_SERVER_NAME: ${HTTP_HOST_HEADER:-proxy-cftunnel}
