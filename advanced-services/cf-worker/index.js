@@ -1,97 +1,126 @@
 // Secret-path gateway in front of a cloudflared quick tunnel.
 //
-//   https://<worker>/<URL_SECRET>/<route path>/<service secret>/<rest...>
+//   https://<worker>/<URL_SECRET>.<SERVICE_SECRET>/<service path...>
+//   https://<worker>/<URL_SECRET>/<service path...>     (service without a secret)
 //
-// The Worker has no secrets of its own. Everything lives in the KV namespace
-// bound as TUNNEL_KV, written by the containers:
-//   CF_TUNNEL_REDIRECT  current trycloudflare URL   (cftunnel container)
-//   CF_TUNNEL_CONFIG    routes + secret hashes      (proxy container, from services.ini)
+// What the Worker does, in order:
+//   1. Splits the first path segment into <URL_SECRET>.<SERVICE_SECRET>
+//      ("." is not allowed in either secret, so the split is unambiguous).
+//   2. Checks the URL secret against the Secrets Store. Wrong or missing ->
+//      401 with a message, before the tunnel or nginx is ever bothered.
+//      This is the gate that stops scanners/fake traffic at the edge.
+//   3. Reads the current trycloudflare URL from KV (the cftunnel container
+//      republishes it there on every tunnel restart) and forwards the
+//      request there as /<service path...>, with:
+//        X-Tunnel-Secret   = PROXY_TUNNEL_SECRET   (nginx 444s anything without
+//                                                   it: direct hits on the raw
+//                                                   trycloudflare URL die there)
+//        X-Service-Secret  = <SERVICE_SECRET>      (nginx checks it per service)
+//      Both secrets come from the Secrets Store too. Neither ever appears in
+//      a path, query or access log past this point; nginx strips both headers
+//      before proxying to the actual service.
 //
-// Secrets are stored as SHA-256 hashes, so reading KV doesn't reveal them.
+// Bindings (provisioned by deploy.sh, which also fills the store):
+//   URL_SECRET, PROXY_TUNNEL_SECRET   Secrets Store secrets
+//                                     (plain Worker secrets also work - readSecret())
+//   TUNNEL_KV                         KV namespace holding CF_TUNNEL_REDIRECT
 
 const KV_URL_KEY = "CF_TUNNEL_REDIRECT";
-const KV_CONFIG_KEY = "CF_TUNNEL_CONFIG";
-const CACHE_MS = 30_000;
+const SEPARATOR = "."; // joins the two secrets; clients never percent-encode it
+const CACHE_MS = 60_000;
 
 const enc = new TextEncoder();
-let cache = { at: 0, tunnel: null, config: null };
+let cache = { at: 0, urlSecret: null, tunnelSecret: null, tunnelUrl: null, urlAt: 0 };
 
-const text = (body, status) => new Response(body, { status });
-const notFound = () => text("Not found", 404);
+const text = (body, status) =>
+  new Response(body + "\n", { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 
-async function sha256Hex(s) {
-  const digest = await crypto.subtle.digest("SHA-256", enc.encode(s));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const unauthorized = () => text("401 Unauthorized: missing or invalid access secret.", 401);
+
+// Secrets Store bindings expose an async .get(); plain Worker secrets are strings.
+async function readSecret(binding) {
+  if (typeof binding === "string") return binding.length ? binding : null;
+  if (binding && typeof binding.get === "function") {
+    try {
+      const v = await binding.get();
+      return typeof v === "string" && v.length ? v : null;
+    } catch {
+      return null; // store unreachable -> report "not configured", not a 500
+    }
+  }
+  return null;
 }
 
-function safeEqual(a, b) {
-  const x = enc.encode(a), y = enc.encode(b);
-  return x.byteLength === y.byteLength && crypto.subtle.timingSafeEqual(x, y);
-}
-
-async function secretMatches(given, expectedHash) {
-  if (!given || typeof expectedHash !== "string") return false;
-  return safeEqual(await sha256Hex(given), expectedHash);
-}
-
-async function load(env) {
-  if (cache.config && cache.tunnel && Date.now() - cache.at < CACHE_MS) return cache;
-
-  const [tunnel, config] = await Promise.all([
-    env.TUNNEL_KV.get(KV_URL_KEY),
-    env.TUNNEL_KV.get(KV_CONFIG_KEY, "json").catch(() => null),
+async function loadSecrets(env) {
+  if (cache.urlSecret && cache.tunnelSecret && Date.now() - cache.at < CACHE_MS) return cache;
+  const [urlSecret, tunnelSecret] = await Promise.all([
+    readSecret(env.URL_SECRET),
+    readSecret(env.PROXY_TUNNEL_SECRET),
   ]);
-  cache = { at: Date.now(), tunnel: tunnel?.trim() || null, config };
+  cache.urlSecret = urlSecret;
+  cache.tunnelSecret = tunnelSecret;
+  cache.at = Date.now();
   return cache;
 }
 
-// Longest route whose path segments are a prefix of the request's segments.
-function findRoute(routes, segments) {
-  let best = null;
-  for (const r of routes) {
-    const segs = r.path.split("/").slice(1);
-    if (segs.length <= (best?.segs.length ?? 0)) continue;
-    if (segs.every((s, i) => segments[i] === s)) best = { ...r, segs };
-  }
-  return best;
+// Hash both sides first so the comparison is constant-time AND length-independent.
+async function secretsEqual(given, expected) {
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(given)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  return crypto.subtle.timingSafeEqual(a, b);
+}
+
+async function loadTunnelUrl(env) {
+  if (cache.tunnelUrl && Date.now() - cache.urlAt < CACHE_MS) return cache.tunnelUrl;
+  const v = (await env.TUNNEL_KV.get(KV_URL_KEY))?.trim() || null;
+  cache.tunnelUrl = v;
+  cache.urlAt = Date.now();
+  return v;
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const { tunnel, config } = await load(env);
 
-    if (
-      !config || config.v !== 1 || !Array.isArray(config.routes) ||
-      typeof config.tunnel_secret !== "string"
-    ) {
-      return text("Not configured", 503);
+    // /<token>/<service path...>   with token = <URL_SECRET>[.<SERVICE_SECRET>]
+    const [token = "", ...pathSegs] = url.pathname.split("/").slice(1);
+    let givenUrlSecret = token,
+      serviceSecret = "";
+    const i = token.indexOf(SEPARATOR);
+    if (i !== -1) {
+      givenUrlSecret = token.slice(0, i);
+      serviceSecret = token.slice(i + 1);
     }
 
-    // /<url secret>/<route path...>/<service secret>/<rest...>
-    const [urlSecret, ...tail] = url.pathname.split("/").slice(1);
-    if (!(await secretMatches(urlSecret, config.url_secret_sha256))) return notFound();
+    const { urlSecret, tunnelSecret } = await loadSecrets(env);
+    if (!urlSecret || !tunnelSecret) return text("503 Worker secrets are not configured.", 503);
 
-    const route = findRoute(config.routes, tail);
-    if (!route) return notFound();
-
-    let rest = tail.slice(route.segs.length);
-    if (route.secret_sha256) {
-      if (!(await secretMatches(rest[0], route.secret_sha256))) return notFound();
-      rest = rest.slice(1);
+    // 1. The gate. Everything below only runs for callers who know the URL secret.
+    if (!givenUrlSecret || !(await secretsEqual(givenUrlSecret, urlSecret))) {
+      return unauthorized();
     }
 
-    if (!tunnel) return text("Tunnel offline", 502);
+    if (pathSegs.length === 0 || pathSegs[0] === "") return text("404 No service path.", 404);
 
-    // Secrets are stripped: the backend only sees <route path>/<rest>.
-    const target = new URL(tunnel);
-    target.pathname = route.path + (rest.length ? "/" + rest.join("/") : "");
+    // 2. Where is the tunnel right now?
+    const tunnelUrl = await loadTunnelUrl(env);
+    if (!tunnelUrl) return text("502 Tunnel offline.", 502);
+
+    // 3. Forward. Client-supplied copies of our headers are overwritten, never trusted.
+    const target = new URL(tunnelUrl);
+    target.pathname = "/" + pathSegs.join("/");
     target.search = url.search;
 
     const headers = new Headers(request.headers);
-    headers.set("X-Tunnel-Secret", config.tunnel_secret);
+    headers.set("Host", target.hostname); // the edge routes the subrequest by tunnel host
+    headers.set("X-Tunnel-Secret", tunnelSecret);
+    if (serviceSecret) headers.set("X-Service-Secret", serviceSecret);
+    else headers.delete("X-Service-Secret");
     headers.set("X-Client-IP", request.headers.get("CF-Connecting-IP") ?? "");
     headers.set("X-Forwarded-Host", url.host);
+    headers.set("X-Forwarded-Proto", "https");
 
     try {
       const res = await fetch(
@@ -102,11 +131,11 @@ export default {
           redirect: "manual",
         }),
       );
-      if (res.status === 530) cache.at = 0; // tunnel gone: re-read its URL next time
+      if (res.status === 530) cache.urlAt = 0; // tunnel gone: re-read its URL next time
       return res;
     } catch {
-      cache.at = 0;
-      return text("Upstream error", 502);
+      cache.urlAt = 0;
+      return text("502 Upstream error.", 502);
     }
   },
 };

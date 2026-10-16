@@ -1,23 +1,24 @@
 #!/bin/bash
 #
 # nginx container startup hook (runs from /docker-entrypoint.d before nginx starts).
-# Reads services.ini, then:
-#   1. generates the nginx upstream/location blocks
-#   2. publishes the routing table to Workers KV so the Worker knows which paths
-#      exist and which secrets guard them (URL/service secrets go up as SHA-256
-#      hashes, never in plaintext)
+# Reads services.ini and generates three nginx include files in GEN_DIR:
+#   upstreams.conf   one upstream per service
+#   maps.conf        one `map` per secret-guarded service (checks X-Service-Secret)
+#   locations.conf   one location per service (401s when its secret is wrong)
 #
-# Required env: URL_SECRET, PROXY_TUNNEL_SECRET, ACCOUNT_ID, NAMESPACE_ID, API_TOKEN
+# The Worker upstream has already gated the request on the URL secret and
+# forwards the service secret (from the URL token) as X-Service-Secret, so
+# nothing here needs to talk to Cloudflare - no API token in this container.
+#
+# Required env: PROXY_TUNNEL_SECRET
 #               plus every env var named by a `secret =` line in services.ini
 # Optional env: SERVICES_INI   (default /etc/nginx/services.ini)
 #               GEN_DIR        (default /etc/nginx/generated)
-#               KV_CONFIG_KEY  (default CF_TUNNEL_CONFIG)
 
 set -euo pipefail
 
 SERVICES_INI="${SERVICES_INI:-/etc/nginx/services.ini}"
 GEN_DIR="${GEN_DIR:-/etc/nginx/generated}"
-KV_CONFIG_KEY="${KV_CONFIG_KEY:-CF_TUNNEL_CONFIG}"
 
 log() { echo "[services] $*"; }
 die() { echo "[services] CRITICAL ERROR: $*" >&2; exit 1; }
@@ -31,24 +32,13 @@ RE_SECRET='^[A-Za-z0-9_-]{24,}$'
 
 declare -A CFG=()
 SECTIONS=()
-ROUTES='[]'
-
-sha256() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 
 # ---------- preflight ----------
 
 preflight() {
-    command -v jq   >/dev/null 2>&1 || die "jq is not installed in this image."
-    command -v curl >/dev/null 2>&1 || die "curl is not installed in this image."
-
-    local v
-    for v in URL_SECRET PROXY_TUNNEL_SECRET ACCOUNT_ID NAMESPACE_ID API_TOKEN; do
-        [ -n "${!v:-}" ] || die "$v is empty! Check your compose.yml / .env"
-    done
-    for v in URL_SECRET PROXY_TUNNEL_SECRET; do
-        [[ "${!v}" =~ $RE_SECRET ]] \
-            || die "$v must be 24+ chars of A-Z a-z 0-9 _ - (try: openssl rand -hex 32)"
-    done
+    [ -n "${PROXY_TUNNEL_SECRET:-}" ] || die "PROXY_TUNNEL_SECRET is empty! Check your compose.yml / .env"
+    [[ "$PROXY_TUNNEL_SECRET" =~ $RE_SECRET ]] \
+        || die "PROXY_TUNNEL_SECRET must be 24+ chars of A-Z a-z 0-9 _ - (try: openssl rand -hex 32)"
 }
 
 # ---------- services.ini ----------
@@ -87,7 +77,7 @@ parse_ini() {
     [ "${#SECTIONS[@]}" -gt 0 ] || die "no services defined in $SERVICES_INI"
 }
 
-# ---------- nginx config + routing table ----------
+# ---------- nginx config ----------
 
 check_path() { # label, value
     [[ "$2" =~ $RE_PATH ]] \
@@ -98,10 +88,11 @@ check_path() { # label, value
 generate() {
     mkdir -p "$GEN_DIR"
     : > "$GEN_DIR/upstreams.conf"
+    : > "$GEN_DIR/maps.conf"
     : > "$GEN_DIR/locations.conf"
 
     declare -A seen_paths=() seen_names=()
-    local s path upstream scheme backend secret_var secret hash up_name
+    local s path upstream scheme backend secret_var secret up_name
 
     for s in "${SECTIONS[@]}"; do
         path="${CFG[$s.path]:-}"
@@ -119,63 +110,52 @@ generate() {
         [[ "$scheme" == http || "$scheme" == https ]] || die "[$s] scheme must be http or https"
         [ -z "$backend" ] || check_path "[$s] backend_path" "$backend"
 
-        hash=""
-        if [ -n "$secret_var" ]; then
-            [[ "$secret_var" =~ $RE_ENVNAME ]] \
-                || die "[$s] 'secret =' takes the NAME of an env var, not the secret itself"
-            secret="${!secret_var:-}"
-            [ -n "$secret" ] || die "[$s] env var $secret_var is empty or unset (add it to .env)"
-            [[ "$secret" =~ $RE_SECRET ]] \
-                || die "[$s] $secret_var must be 24+ chars of A-Z a-z 0-9 _ - (try: openssl rand -hex 32)"
-            hash=$(sha256 "$secret")
-        fi
-
+        # - and _ would create clashing upstream names, treat them as the same
         up_name="svc_${s//-/_}"
         [ -z "${seen_names[$up_name]:-}" ] || die "[$s] section name clashes with another one (- and _ are treated the same)"
         seen_names[$up_name]=1
 
         printf 'upstream %s { server %s; }\n' "$up_name" "$upstream" >> "$GEN_DIR/upstreams.conf"
+
+        # The map is what actually checks the secret: $svc_<name>_ok is 1 only
+        # when X-Service-Secret matches exactly. nginx map keys are literals
+        # here (RE_SECRET bans "~"), compared after the map hash - close enough
+        # to constant time for this threat model, and never logged.
+        if [ -n "$secret_var" ]; then
+            [[ "$secret_var" =~ $RE_ENVNAME ]] \
+                || die "[$s] 'secret =' takes the NAME of an env var, not the secret itself"
+            secret="${!secret_var:-}"
+            [ -n "$secret" ] || die "[$s] env var $secret_var is empty or unset (add it to proxy.env)"
+            [[ "$secret" =~ $RE_SECRET ]] \
+                || die "[$s] $secret_var must be 24+ chars of A-Z a-z 0-9 _ - (try: openssl rand -hex 32)"
+
+            # shellcheck disable=SC2016  # $http_x_service_secret / $svc_* are nginx variables, not shell
+            printf 'map $http_x_service_secret $svc_%s_ok {\n    default 0;\n    "%s" 1;\n}\n' \
+                "$up_name" "$secret" >> "$GEN_DIR/maps.conf"
+        fi
+
         {
             printf '# [%s]\n' "$s"
             printf 'location ^~ %s {\n' "$path"
+            if [ -n "$secret_var" ]; then
+                printf '    # %s is a map from maps.conf (1 only with the right X-Service-Secret)\n' "\$svc_${up_name}_ok"
+                # shellcheck disable=SC2016  # $svc_* is an nginx variable
+                printf '    if ($svc_%s_ok = 0) { return 401; }\n' "$up_name"
+            fi
             printf '    proxy_pass %s://%s%s;\n' "$scheme" "$up_name" "$backend"
-            printf '    include /etc/nginx/snippets/mcp-proxy.conf;\n'
+            printf '    include /etc/nginx/snippets/proxy.conf;\n'
             printf '}\n\n'
         } >> "$GEN_DIR/locations.conf"
-
-        ROUTES=$(jq -c --arg path "$path" --arg h "$hash" \
-            '. + [{path: $path} + (if $h == "" then {} else {secret_sha256: $h} end)]' <<<"$ROUTES")
 
         log "route $path -> $scheme://$upstream${backend:+ (as $backend)} [${secret_var:-no secret}]"
     done
 }
 
-# Refuse to publish routes for a config nginx won't load.
+# Refuse to start on a config nginx won't load.
 validate_nginx() {
     command -v nginx >/dev/null 2>&1 || return 0
     local out
-    out=$(nginx -t 2>&1) || { echo "$out" >&2; die "generated nginx config is invalid, not publishing routes."; }
-}
-
-# ---------- publish to Worker KV ----------
-
-publish() {
-    local url_hash payload resp
-    url_hash=$(sha256 "$URL_SECRET")
-    payload=$(jq -n -c \
-        --arg t "$PROXY_TUNNEL_SECRET" --arg u "$url_hash" --argjson r "$ROUTES" \
-        '{v: 1, tunnel_secret: $t, url_secret_sha256: $u, routes: $r}')
-
-    log "Publishing routing table to Worker KV ($KV_CONFIG_KEY)..."
-    resp=$(curl -sS --fail-with-body --max-time 20 --retry 3 --retry-all-errors --retry-delay 2 \
-        -X PUT \
-        "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${NAMESPACE_ID}/values/${KV_CONFIG_KEY}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: text/plain" \
-        --data-binary "$payload" 2>&1) \
-        || { echo "$resp" >&2; die "failed to write $KV_CONFIG_KEY to KV (check ACCOUNT_ID / NAMESPACE_ID; API_TOKEN needs 'Workers KV Storage: Edit')."; }
-
-    log "Worker KV updated (${#SECTIONS[@]} service(s)). Allow up to ~60s for KV to propagate."
+    out=$(nginx -t 2>&1) || { echo "$out" >&2; die "generated nginx config is invalid."; }
 }
 
 # ---------- main ----------
@@ -184,4 +164,3 @@ preflight
 parse_ini
 generate
 validate_nginx
-publish

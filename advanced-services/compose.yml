@@ -9,27 +9,36 @@ services:
       ACCOUNT_ID: ${ACCOUNT_ID}
       NAMESPACE_ID: ${NAMESPACE_ID}
       API_TOKEN: ${API_TOKEN}
-      HTTP_HOST_HEADER: ${HTTP_HOST_HEADER}
+      # Fixed Host cloudflared rewrites to before hitting nginx. Quick-tunnel
+      # hostnames change on every restart, so nginx matches this name instead
+      # (HTTP_SERVER_NAME below is set from the same value).
+      HTTP_HOST_HEADER: ${HTTP_HOST_HEADER:-proxy-cftunnel}
     volumes:
-      - "/etc/ssl/certs/reverse-proxy.pem:/etc/ssl/certs/server.crt:ro"
+      - "./server.crt:/etc/ssl/certs/server.crt:ro"
     networks:
       - cftunnel
     build:
       context: ./cftunnel
 
-  # for the services
+  # nginx: checks X-Tunnel-Secret (from the Worker), routes by path and checks
+  # each service's X-Service-Secret. It never needs to talk to Cloudflare, so
+  # it gets NO account credentials - only its own secrets via proxy.env.
   proxy:
     image: proxy-cftunnel:latest
     container_name: proxy-cftunnel
     restart: unless-stopped
     build:
       context: ./nginx
-    # Passes the whole .env through, so a new service only needs a line in
-    # .env and a section in services.ini, with no compose edits.
-    env_file: .env
     environment:
       NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
-      PROXY_TUNNEL_SECRET: ${PROXY_ENTRY_SECRET}
+      PROXY_TUNNEL_SECRET: ${PROXY_TUNNEL_SECRET}
+      # what cloudflared rewrites the Host header to; must match server_name
+      # in nginx.conf.template (defaults to HTTP_HOST_HEADER in the .env)
+      HTTP_SERVER_NAME: ${HTTP_HOST_HEADER:-proxy-cftunnel}
+    # Service secrets only (one var per `secret =` line in services.ini).
+    # cp proxy.env.example proxy.env and fill it in.
+    env_file:
+      - ./proxy.env
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
