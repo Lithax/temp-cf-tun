@@ -1,0 +1,22 @@
+# One section per MCP service. The section name is just a label.
+#
+#   path          path the Worker forwards and nginx matches            (required)
+#   upstream      host:port of the backend                              (required)
+#   secret        NAME of the env var holding this service's secret     (optional)
+#   scheme        https (default) or http
+#   backend_path  rewrite the matched path to this before the backend   (optional)
+#
+# Public URL for a service with a secret:
+#   https://<worker>/<URL_SECRET><path>/<that service's secret>
+
+[shell]
+path = /mcp/shell
+upstream = host.docker.internal:10443
+secret = MCP_SHELL_SECRET
+
+# [files]
+# path = /mcp/files
+# upstream = host.docker.internal:10444
+# secret = MCP_FILES_SECRET
+# scheme = http
+# backend_path = /mcp

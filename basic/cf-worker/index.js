@@ -19,6 +19,7 @@ var index_default = {
     if (!success) {
       return new Response("Too Many Requests. Please slow down.", { status: 429 });
     }
+
     const auth = request.headers.get("Authorization");
     if (!auth || !auth.startsWith("Basic ")) return authFail();
     const base64 = auth.slice(6);
@@ -30,11 +31,14 @@ var index_default = {
     if (!tunnelBaseUrl) {
       return new Response("Tunnel URL not found in KV storage.", { status: 404 });
     }
+
     const incomingUrl = new URL(request.url);
     const targetUrl = new URL(incomingUrl.pathname + incomingUrl.search, tunnelBaseUrl);
     const proxyHeaders = new Headers(request.headers);
     proxyHeaders.set("X-Tunnel-Secret", env.SHARED_SECRET);
     proxyHeaders.set("Host", targetUrl.hostname);
+    proxyHeaders.set("X-Forwarded-Host", incomingUrl.hostname);
+
     const proxyRequest = new Request(targetUrl.toString(), {
       method: request.method,
       headers: proxyHeaders,
