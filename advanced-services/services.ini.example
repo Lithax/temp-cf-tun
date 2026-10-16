@@ -3,11 +3,14 @@
 #   path          path the Worker forwards and nginx matches            (required)
 #   upstream      host:port of the backend                              (required)
 #   secret        NAME of the env var holding this service's secret     (optional)
+#                 (the variable lives in proxy.env, never in this file)
 #   scheme        https (default) or http
 #   backend_path  rewrite the matched path to this before the backend   (optional)
 #
 # Public URL for a service with a secret:
-#   https://<worker>/<URL_SECRET><path>/<that service's secret>
+#   https://<worker>/<URL_SECRET>.<SERVICE_SECRET><path>
+# and without a secret:
+#   https://<worker>/<URL_SECRET><path>
 
 [shell]
 path = /mcp/shell

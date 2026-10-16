@@ -30,6 +30,8 @@
 #
 # The API token (dash -> My Profile -> API Tokens) needs:
 #   Workers Scripts:Edit     Workers KV Storage:Edit     Secrets Store:Edit
+#   (make it a custom token - the "Edit Cloudflare Workers" template does
+#    not include Secrets Store, and the store calls fail with a 403)
 #
 # Secret values are never printed or logged, and never accepted as CLI
 # arguments (they would end up in shell history / ps).
@@ -67,7 +69,8 @@ Config from ../.env or the environment: ACCOUNT_ID, API_TOKEN, WORKER_NAME,
 NAMESPACE_ID, URL_SECRET, PROXY_TUNNEL_SECRET, STORE_NAME (optional).
 
 API token needs: Workers Scripts:Edit, Workers KV Storage:Edit,
-Secrets Store:Edit.
+Secrets Store:Edit (a custom token - the "Edit Cloudflare Workers"
+template does not include it).
 EOF
     exit 0
 }
@@ -127,6 +130,36 @@ preflight() {
 
 # ---------- api helpers ----------
 
+# Cloudflare answers a token that lacks a permission with HTTP 403 +
+# code 10000 "Authentication error" - the same body for every endpoint and
+# every missing permission, which is why the raw curl error is so useless.
+# Map the failed call to the permission it needs, or spot a dead token.
+# Prints "" when the failure is neither of those.
+api_error_hint() { # PATH CURL_OUT -> hint text on stdout ("" if undiagnosable)
+    local path="$1" out="$2" perm="" extra=""
+    grep -q 'returned error: 40[013]' <<<"$out" || return 0
+    grep -q '"code": *10000' <<<"$out" || return 0
+    if ! grep -q 'returned error: 403' <<<"$out"; then
+        printf '\n  what this means: the token itself was rejected (invalid,\n  expired, revoked, or a typo in API_TOKEN).\n'
+        return 0
+    fi
+    case "$path" in
+        *secrets_store*)
+            perm="Secrets Store:Edit"
+            extra='
+  note: the "Edit Cloudflare Workers" token template does not include it -
+  it has to be a custom token. And if "Secrets Store" is not offered in the
+  permission editor at all, this account is not in the Secrets Store open
+  beta: re-run with --plain-secrets to bind the two secrets as plain
+  Worker secrets instead (identical runtime behavior).'
+            ;;
+        *storage/kv*) perm="Workers KV Storage:Edit" ;;
+        *workers/*)   perm="Workers Scripts:Edit" ;;
+        *)            return 0 ;;
+    esac
+    printf '\n  what this means: the token authenticated, but it lacks a permission\n  this endpoint needs (Cloudflare always says that as 403 + code 10000).\n  fix: dash -> My Profile -> API Tokens -> ... on the token -> Edit ->\n  Account Permissions -> add "%s" -> Save, then re-run this script.%s\n' "$perm" "$extra"
+}
+
 # cf METHOD PATH [JSON_BODY] -> prints the response body, dies on failure
 cf() {
     local method="$1" path="$2" data="${3:-}" out rc=0
@@ -136,7 +169,7 @@ cf() {
         args+=(-H "Content-Type: application/json" --data "$data")
     fi
     out="$("${args[@]}" 2>&1)" || rc=$?
-    [ "$rc" -eq 0 ] || die "API $method $path failed (curl exit $rc): $out"
+    [ "$rc" -eq 0 ] || die "API $method $path failed (curl exit $rc): $out$(api_error_hint "$path" "$out")"
     jq -e '.success == true' >/dev/null 2>&1 <<<"$out" \
         || die "API $method $path returned an error: $out"
     printf '%s' "$out"
@@ -241,7 +274,7 @@ upload_worker() {
         -H "Authorization: Bearer $API_TOKEN" \
         -F "metadata=$metadata;type=application/json" \
         -F "index.js=@$SCRIPT_DIR/index.js;type=application/javascript+module" 2>&1) || rc=$?
-    [ "$rc" -eq 0 ] || die "worker upload failed (curl exit $rc): $out"
+    [ "$rc" -eq 0 ] || die "worker upload failed (curl exit $rc): $out$(api_error_hint "/accounts/$ACCOUNT_ID/workers/scripts/$WORKER_NAME" "$out")"
     jq -e '.success == true' >/dev/null 2>&1 <<<"$out" \
         || die "worker upload rejected: $out"
     log "worker uploaded (script id: $(jq -r '.result.id // "?"' <<<"$out"))"
