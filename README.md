@@ -148,3 +148,6 @@ Worker secrets if your account can't use the Secrets Store.
 Plain Worker (Basic auth + rate limit) in front of one nginx. See
 `basic/compose.yml`; the Worker needs its bindings (USER, PASSWORD,
 SHARED_SECRET, KV) set up in the dash or with wrangler.
+
+# IMPORTANT
+if you want your proxy to reach services like MCP servers listening on localhost, make sure your firewall isnt blocking nginx from reaching them, cheers!

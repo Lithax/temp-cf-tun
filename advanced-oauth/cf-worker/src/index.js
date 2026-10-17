@@ -536,8 +536,15 @@ function resourceFor(path, resources) {
   return resources.find((r) => pathCovers(r.path, p));
 }
 
-export default {
+const route = {
   async fetch(request, env, ctx) {
+    // Only this Worker's own proxy() sends the real X-Tunnel-Secret. If a request arrives carrying it, the
+    // quick tunnel is pointing back at this Worker (check SERVICE_URL in .env) - refuse the loop.
+    const stamped = request.headers.get("x-tunnel-secret");
+    if (stamped && typeof env.PROXY_TUNNEL_SECRET === "string" && (await secretsEqual(stamped, env.PROXY_TUNNEL_SECRET))) {
+      console.error("LOOP: request carries X-Tunnel-Secret; the tunnel's origin is this Worker, not nginx");
+      return text("508 Loop detected: the tunnel forwards back to this Worker. Check SERVICE_URL in advanced-oauth/.env (should be https://proxy-cftunnel:9443).", 508);
+    }
     let app;
     try {
       app = getApp(env);
@@ -565,4 +572,36 @@ export default {
     const { as } = getApp(env);
     ctx.waitUntil(as.purgeExpiredData(env).then((r) => console.log("purge:", JSON.stringify(r))));
   },
+};
+
+// Debug (delete once the connector works): one log line per request with the real HTTP status.
+// Logs shapes only: header NAMES, token lengths, field names. Never token values, codes or verifiers.
+const shape = (t) => (typeof t === "string" ? `len=${t.length},parts=${t.split(":").length}` : "none");
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    let pre = "";
+    try {
+      if (url.pathname.startsWith("/mcp/")) {
+        const a = request.headers.get("authorization");
+        pre = ` | auth=${a ? a.split(" ")[0] + "/" + shape(a.split(" ").slice(1).join(" ")) : "NONE"}` +
+          ` | headers=${[...request.headers.keys()].filter((k) => !k.startsWith("cf-") && !k.startsWith("x-forwarded")).join(",")}`;
+      } else if (url.pathname === "/oauth/token" && request.method === "POST") {
+        const f = await request.clone().formData();
+        pre = ` | grant=${f.get("grant_type")} client_id=${f.get("client_id")} resource=${f.get("resource")} redirect_uri=${f.get("redirect_uri")} scope=${f.get("scope")} has_secret=${f.has("client_secret")} has_assertion=${f.has("client_assertion")}`;
+      }
+    } catch {}
+    const res = await route.fetch(request, env, ctx);
+    try {
+      const www = res.headers.get("www-authenticate");
+      let post = "";
+      if (url.pathname === "/oauth/token") {
+        const j = await res.clone().json().catch(() => null);
+        if (j) post = ` | resp keys=${Object.keys(j).join(",")} token_type=${j.token_type} expires_in=${j.expires_in} scope=${JSON.stringify(j.scope)} access=${shape(j.access_token)} error=${j.error ?? ""} ${j.error_description ?? ""}`;
+      }
+      console.log(`${request.method} ${url.pathname} -> ${res.status}${pre}${post}` + (www ? ` | www-authenticate: ${www.slice(0, 240)}` : ""));
+    } catch {}
+    return res;
+  },
+  scheduled: route.scheduled,
 };

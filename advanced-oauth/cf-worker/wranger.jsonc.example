@@ -1,0 +1,42 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	// Use the same name as your old advanced-services Worker (WORKER_NAME in ../.env) to replace it
+	// on deploy, so your workers.dev hostname stays the same.
+	"name": "personal",
+	"main": "src/index.js",
+	"compatibility_date": "2026-07-29",
+	// Needed for Client ID Metadata Documents (the Worker fetches client-supplied URLs; this blocks
+	// private addresses). It also makes the Worker's own fetch() "strictly public", which is what
+	// the tunnel call wants anyway.
+	"compatibility_flags": [
+		"global_fetch_strictly_public"
+	],
+	"workers_dev": true,
+	"preview_urls": false, // the Worker only answers on PUBLIC_ORIGIN; preview hostnames would just 404
+	"kv_namespaces": [
+  	{ "binding": "OAUTH_KV",  "id": "...", "remote": true },
+  	{ "binding": "TUNNEL_KV", "id": "...", "remote": true }
+	],
+	"vars": {
+		// The OAuth issuer and the host Claude connects to. Must match exactly (https, lowercase, no path).
+		"PUBLIC_ORIGIN": "...",
+		// Same paths as `path =` in services.ini. Each one is its own token audience.
+		"SERVICES": "/mcp/shell",
+		// Exact redirect URIs OAuth clients may use. These are Claude's two web callbacks.
+		"ALLOWED_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback",
+		// Set to "true" only if you also connect Claude Code / a desktop client on localhost.
+		"ALLOW_LOOPBACK_REDIRECTS": "false",
+		"ACCESS_TOKEN_TTL_SECONDS": "3600",
+		"GRANT_LIFETIME_DAYS": "30"
+	},
+	// Secrets (not here): npx wrangler secret put OWNER_PASSWORD
+	//                     npx wrangler secret put PROXY_TUNNEL_SECRET   (same value as in ../.env / nginx)
+	"triggers": {
+		"crons": [
+			"17 4 * * *"
+		]
+	},
+	"observability": {
+		"enabled": true
+	}
+}
