@@ -248,7 +248,7 @@ upload_worker() {
             --arg ns "$NAMESPACE_ID" --arg us "$URL_SECRET" --arg ts "$PROXY_TUNNEL_SECRET" \
             --arg d "$COMPAT_DATE" \
             '{main_module: "index.js", compatibility_date: $d, bindings: [
-                {type: "kv_namespace",    name: "TUNNEL_KV",          namespace_id: $ns},
+                {type: "kv_namespace",    name: "personal",          namespace_id: $ns},
                 {type: "secret_text",     name: "URL_SECRET",         text: $us},
                 {type: "secret_text",     name: "PROXY_TUNNEL_SECRET", text: $ts}
              ]}')
@@ -256,7 +256,7 @@ upload_worker() {
         metadata=$(jq -cn \
             --arg ns "$NAMESPACE_ID" --arg st "$STORE_ID" --arg d "$COMPAT_DATE" \
             '{main_module: "index.js", compatibility_date: $d, bindings: [
-                {type: "kv_namespace",          name: "TUNNEL_KV",          namespace_id: $ns},
+                {type: "kv_namespace",          name: "personal",          namespace_id: $ns},
                 {type: "secrets_store_secret",  name: "URL_SECRET",         store_id: $st, secret_name: "URL_SECRET"},
                 {type: "secrets_store_secret",  name: "PROXY_TUNNEL_SECRET", store_id: $st, secret_name: "PROXY_TUNNEL_SECRET"}
              ]}')

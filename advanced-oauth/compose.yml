@@ -1,0 +1,50 @@
+services:
+  # if you only want the cftunnel and nothing else, only use this
+  cloudflared:
+    image: cfquicktunnel:latest
+    container_name: cftunnel
+    restart: unless-stopped
+    environment:
+      SERVICE_URL: ${SERVICE_URL}
+      ACCOUNT_ID: ${ACCOUNT_ID}
+      NAMESPACE_ID: ${NAMESPACE_ID}
+      API_TOKEN: ${API_TOKEN}
+      # Fixed Host cloudflared rewrites to before hitting nginx. Quick-tunnel
+      # hostnames change on every restart, so nginx matches this name instead
+      # (HTTP_SERVER_NAME below is set from the same value).
+      HTTP_HOST_HEADER: ${HTTP_HOST_HEADER:-proxy-cftunnel}
+    volumes:
+      - "./server.crt:/etc/ssl/certs/server.crt:ro"
+    networks:
+      - cftunnel
+    build:
+      context: ./cftunnel
+
+  # nginx: checks X-Tunnel-Secret (stamped by the Worker after it validated the
+  # OAuth token) and routes by path. It never talks to Cloudflare, so it gets NO
+  # account credentials - only the tunnel secret.
+  proxy:
+    image: proxy-cftunnel:latest
+    container_name: proxy-cftunnel
+    restart: unless-stopped
+    build:
+      context: ./nginx
+    environment:
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      PROXY_TUNNEL_SECRET: ${PROXY_TUNNEL_SECRET}
+      # what cloudflared rewrites the Host header to; must match server_name
+      # in nginx.conf.template (defaults to HTTP_HOST_HEADER in the .env)
+      HTTP_SERVER_NAME: ${HTTP_HOST_HEADER:-proxy-cftunnel}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+      - ./services.ini:/etc/nginx/services.ini:ro
+      - ../server.crt:/etc/nginx/certs/server.crt:ro
+      - ../server.key:/etc/nginx/certs/server.key:ro
+    networks:
+      - cftunnel
+
+networks:
+  cftunnel:
+    external: true

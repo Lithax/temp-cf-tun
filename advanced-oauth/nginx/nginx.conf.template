@@ -1,0 +1,117 @@
+worker_processes 4;
+error_log /dev/stderr warn;
+
+events {
+    worker_connections 32;
+}
+
+http {
+    server_tokens off;
+    proxy_hide_header Server;
+
+    # A 64-char hex secret in the map below overflows the default bucket size
+    # and nginx refuses to start ("could not build map_hash").
+    map_hash_bucket_size 128;
+
+    # ------------------------------------------------------------------
+    # Helpers (maps must come before anything that uses their variables)
+    # ------------------------------------------------------------------
+
+    # WebSockets: only send "Connection: upgrade" when the client asked for it.
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ""      close;
+    }
+
+    # 1 if the request carries the shared secret the Worker adds, else 0.
+    # Anything hitting the tunnel URL directly (no Worker in front) has no
+    # X-Tunnel-Secret and gets dropped with 444 below.
+    # Use a non-empty alphanumeric secret (e.g. `openssl rand -hex 32`):
+    # an empty one would match header-less requests, and a leading "~" would
+    # be treated as a regex by map.
+    map $http_x_tunnel_secret $tunnel_secret_ok {
+        default                   0;
+        "${PROXY_TUNNEL_SECRET}"  1;
+    }
+
+    # Real visitor IP as forwarded by the Worker in X-Client-IP. Only used
+    # after the secret check passes; otherwise falls back to the TCP peer
+    # (cloudflared). The regex limits it to IP-address characters.
+    map $http_x_client_ip $client_ip {
+        default                    $remote_addr;
+        "~^[0-9a-fA-F:.]{3,45}$"   $http_x_client_ip;
+    }
+
+    # ------------------------------------------------------------------
+    # Rate limiting and logging
+    # ------------------------------------------------------------------
+
+    limit_req_zone $client_ip zone=secure_limit:10m rate=10r/s;
+    limit_req_status 429;
+
+    log_format main '$client_ip - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_user_agent" host=$host';
+    access_log /dev/stdout main;
+
+    # ------------------------------------------------------------------
+    # TLS (inherited by every server below)
+    # ------------------------------------------------------------------
+
+    ssl_certificate     /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # ------------------------------------------------------------------
+    # Backends: one upstream per service, generated from services.ini
+    # ------------------------------------------------------------------
+
+    include /etc/nginx/generated/upstreams.conf;
+
+    # ------------------------------------------------------------------
+    # Catch-all: anything that isn't the expected Host gets no response.
+    # (Has a cert so the handshake works whatever SNI cloudflared sends.)
+    # ------------------------------------------------------------------
+
+    server {
+        listen 9443 ssl default_server;
+        server_name _;
+        return 444;
+    }
+
+    # ------------------------------------------------------------------
+    # The app
+    # ------------------------------------------------------------------
+
+    server {
+        listen 9443 ssl;
+        # Rendered from HTTP_SERVER_NAME (envsubst), which compose sets from
+        # HTTP_HOST_HEADER - the same value cloudflared rewrites the Host
+        # header to (--http-host-header). Quick-tunnel hostnames change on
+        # every restart, so nginx matches this fixed name instead.
+        server_name ${HTTP_SERVER_NAME};
+
+        client_max_body_size 50m;
+
+        # Runs in the rewrite phase, before rate limiting, so direct hits on
+        # the tunnel URL are dropped without consuming anything.
+        if ($tunnel_secret_ok = 0) {
+            return 444;
+        }
+
+        limit_req zone=secure_limit burst=50 nodelay;
+
+        # The Worker is the auth layer (OAuth: a valid token for exactly this
+        # service) and X-Tunnel-Secret above proves the request came through
+        # it, so there is no auth_basic here: MCP clients can't send it.
+
+        # One location per service, generated from services.ini.
+        include /etc/nginx/generated/locations.conf;
+
+        # Anything that isn't a known service path gets dropped.
+        location / {
+            return 444;
+        }
+    }
+}

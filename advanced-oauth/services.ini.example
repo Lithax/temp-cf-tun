@@ -1,0 +1,24 @@
+# One section per MCP service. The section name is just a label.
+#
+#   path          path the Worker forwards and nginx matches            (required)
+#   upstream      host:port of the backend                              (required)
+#   scheme        https (default) or http
+#   backend_path  rewrite the matched path to this before the backend   (optional)
+#
+# Public URL (what you give Claude):  https://<worker>/<path>   e.g. https://<worker>/mcp/shell
+#
+# There is no `secret =` any more: the Worker only forwards a request whose OAuth
+# token was issued for exactly this path, so every service is its own audience.
+# The Worker needs the same paths in SERVICES (cf-worker/wrangler.jsonc).
+#
+# Paths must not overlap: /mcp and /mcp/shell together would let one token open both.
+
+[shell]
+path = /mcp/shell
+upstream = host.docker.internal:10443
+
+# [files]
+# path = /mcp/files
+# upstream = host.docker.internal:10444
+# scheme = http
+# backend_path = /mcp

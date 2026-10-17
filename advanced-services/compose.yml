@@ -45,8 +45,8 @@ services:
     volumes:
       - ./nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
       - ./services.ini:/etc/nginx/services.ini:ro
-      - ./server.crt:/etc/nginx/certs/server.crt:ro
-      - ./server.key:/etc/nginx/certs/server.key:ro
+      - ../server.crt:/etc/nginx/certs/server.crt:ro
+      - ../server.key:/etc/nginx/certs/server.key:ro
     networks:
       - cftunnel
 

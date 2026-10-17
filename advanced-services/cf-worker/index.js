@@ -74,7 +74,7 @@ async function secretsEqual(given, expected) {
 
 async function loadTunnelUrl(env) {
   if (cache.tunnelUrl && Date.now() - cache.urlAt < CACHE_MS) return cache.tunnelUrl;
-  const v = (await env.TUNNEL_KV.get(KV_URL_KEY))?.trim() || null;
+  const v = (await env.personal.get(KV_URL_KEY))?.trim() || null;
   cache.tunnelUrl = v;
   cache.urlAt = Date.now();
   return v;
